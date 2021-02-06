@@ -1,0 +1,225 @@
+#!/usr/bin/env python
+#
+#  Output one line per position with the following fields:
+#         <epd> bm <bestmove>;
+#
+#  Input is any EPD file
+#
+#  Usage:
+#       ./run-simtest-uci <engine> [ <cpus> [ <movetime> ] ]
+#
+#       engine          binary of UCI engine
+#       cpus            number of parallel engines to start (all single-threaded)
+#       movetime        in seconds (float)
+#
+#  For example:
+#       ./run-simtest-uci Shredder12Mac 4 1 < simcsvn1.epd > simcsvn1.shredder12.epd
+#
+#  History:
+#  2012-11-30 (marcelk) Initial version
+#  2012-12-20 (marcelk) Send quit command to engine when done (prevents hanging processes)
+#  2012-12-29 (marcelk) Made robust against empty engine lines
+#  2013-03-01 (marcelk) Terminate the bm EPD field properly with a semi-colon
+#                       Print usage when command line arguments seem wrong
+#
+
+import sys
+import subprocess
+import select
+import time
+
+def usage():
+        print """
+Usage:
+        ./run-simtest-uci <engine> [ <cpus> [ <movetime> ] ]
+
+        engine          binary of UCI engine
+        cpus            number of parallel engines to start (all single-threaded)
+        movetime        in seconds (float)
+
+        For example:
+        ./run-simtest-uci Shredder12Mac 4 1 < simcsvn1.epd > simcsvn1.shredder12.epd
+"""
+
+class Engine:
+        def __init__(self, engine_name):
+                self.process = subprocess.Popen(engine_name, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+                self.id = None
+                self.line = None
+                self.clearHashCommand = None
+
+        def isready(self):
+                self.process.stdin.write("isready\n")
+                while True:
+                        line = self.process.stdout.readline()
+                        if "readyok" in line:
+                                break
+
+        def clearHash(self):
+                if self.clearHashCommand != None:
+                        self.process.stdin.write(self.clearHashCommand)
+                        self.isready()
+
+class EnginePool:
+        def __init__(self, engine_name, engine_count):
+                self.engines = { } # dict: fileno(stdout) to Engine
+                self.busy = set()  # set of fileno(stdout)
+                self.idle = set()  # set of fileno(stdout)
+
+                # Maintain an output buffer to produce in-order output
+                self.input = 0   # input lines read
+                self.output = 0  # output lines written
+                self.buffer = {} # dict: line -> output
+
+                self.ClearHashCommand = None
+
+                for i in range(engine_count):
+                        engine = Engine(engine_name)
+                        fileno = engine.process.stdout.fileno()
+                        self.engines[fileno] = engine
+                        self.idle.add(fileno)
+
+                        engine.process.stdin.write("uci\n")
+                        while True:
+                                line = engine.process.stdout.readline()
+
+                                if "Threads" in line:
+                                        engine.process.stdin.write("setoption name Threads value 1\n")
+
+                                if "OwnBook" in line:
+                                        engine.process.stdin.write("setoption name OwnBook value false\n")
+
+                                if "Clear Hash" in line: # Most engines
+                                        engine.clearHashCommand = "setoption name Clear Hash\n"
+
+                                if "Clear_hash" in line: # Junior 12
+                                        engine.clearHashCommand = "setoption name clear_Hash value true\n"
+
+                                if "registration error" in line:
+                                        sys.exit(10)
+
+                                if "uciok" in line:
+                                        break
+
+                        engine.isready()
+
+        def quit(self):
+                # Terminate all engines
+                for fileno in self.engines:
+                        engine = self.engines[fileno]
+                        engine.process.stdin.write('quit\n')
+                self.engines = {}
+
+        def analyze(self, line, movetime):
+
+                # wait for an angine to be idle
+                if len(self.idle) == 0:
+                        self.wait()
+
+                assert len(self.idle) > 0
+
+                fileno = self.idle.pop()
+                self.busy.add(fileno)
+
+                engine = self.engines[fileno]
+
+                engine.id = self.input
+                engine.line = line
+
+                pos = line.split()[0:4]
+                pos = ' '.join(pos)
+                engine.clearHash()
+                engine.process.stdin.write("ucinewgame\n")
+                engine.isready()
+                engine.process.stdin.write("position fen %s\n" % pos)
+                engine.isready()
+
+                engine.process.stdin.write("go infinite\n") # Not all engines support 'movetime', e.g. Junior 12
+                engine.stop_time = time.time() + movetime
+
+                self.input += 1
+
+        def wait(self):
+                assert len(self.busy) > 0
+
+                while True:
+                        # Figure out which engine must receive the first upcoming stop command
+                        now = time.time()
+                        next = None
+                        timeout = None
+                        for fileno in self.busy:
+                                engine = self.engines[fileno]
+                                if engine.stop_time != None:
+                                        t = engine.stop_time - now
+                                        if next == None or t < timeout:
+                                                next = engine
+                                                timeout = t
+
+                        # Wait for I/O or timeout
+                        if timeout == None:
+                                result = select.select(self.busy, [], [])
+                                fileno = result[0][0]
+                                engine = self.engines[fileno]
+                        elif timeout < 0.0:
+                                timeout = next
+                        else:
+                                result = select.select(self.busy, [], [], timeout)
+                                if len(result[0]) == 0:
+                                        timeout = next
+                                else:
+                                        fileno = result[0][0]
+                                        engine = self.engines[fileno]
+                                        timeout = None
+
+                        if timeout != None:
+                                # Timeout: Send 'stop' and continue
+                                next.process.stdin.write("stop\n")
+                                next.stop_time = None
+                        else:
+                                # I/O happened
+                                line = engine.process.stdout.readline()
+                                line = line.split()
+                                if len(line) > 0 and line[0] == "bestmove":
+                                        break # while True
+
+                self.buffer[engine.id] = "%s bm %s;" % (engine.line, line[1].lower())
+
+                while self.output in self.buffer:
+                        print self.buffer[self.output]
+                        del self.buffer[self.output]
+                        self.output += 1
+                sys.stdout.flush()
+
+                engine.line = None
+
+                self.busy.remove(fileno)
+                self.idle.add(fileno)
+
+if __name__ == '__main__':
+
+        if len(sys.argv) not in [2,3,4]:
+                usage()
+                sys.exit(10)
+
+        engine_name = sys.argv[1]
+
+        if len(sys.argv) > 2:
+                engine_count = int(sys.argv[2])
+        else:
+                engine_count = 1
+
+        if len(sys.argv) > 3:
+                movetime = float(sys.argv[3])
+        else:
+                movetime = 1.0
+
+        engine_pool = EnginePool(engine_name, engine_count)
+
+        for line in sys.stdin:
+                engine_pool.analyze(line.rstrip(), movetime)
+
+        while len(engine_pool.busy) > 0:
+                engine_pool.wait()
+
+        engine_pool.quit()
+

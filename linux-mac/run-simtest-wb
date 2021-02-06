@@ -1,0 +1,207 @@
+#!/usr/bin/env python
+#
+#  Output one line per position with the following fields:
+#         <epd> bm <bestmove>;
+#
+#  Input is any EPD file
+#
+#  Usage:
+#       ./run-simtest-uci <engine> [ <cpus> [ <movetime> ] ]
+#
+#       engine          binary of Winboard engine
+#       cpus            number of parallel engines to start (all single-threaded)
+#       movetime        in seconds (float)
+#
+#  For example:
+#       ./run-simtest-uci Shredder12Mac 4 1 < simcsvn1.epd > simcsvn1.shredder12.epd
+#
+#  History:
+#  2013-04-14 (marcelk) Initial version for Winboard protocol (based on run-simtest-uci/2013-03-01)
+#                       Tested for Crafty 23.4 on MacOSX
+#
+
+import sys
+import subprocess
+import select
+import time
+
+def usage():
+        print """
+Usage:
+        ./run-simtest-wb <engine> [ <cpus> [ <movetime> ] ]
+
+        engine          binary of Winboard engine
+        cpus            number of parallel engines to start (all single-threaded)
+        movetime        in seconds (float)
+
+        For example:
+        ./run-simtest-wb crafty 4 1 < simcsvn1.epd > simcsvn1.crafty.epd
+"""
+
+class Engine:
+        def __init__(self, engine_name):
+                self.process = subprocess.Popen(engine_name, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+                self.id = None
+                self.line = None
+
+class EnginePool:
+        def __init__(self, engine_name, engine_count):
+                self.engines = { } # dict: fileno(stdout) to Engine
+                self.busy = set()  # set of fileno(stdout)
+                self.idle = set()  # set of fileno(stdout)
+
+                # Maintain an output buffer to produce in-order output
+                self.input = 0   # input lines read
+                self.output = 0  # output lines written
+                self.buffer = {} # dict: line -> output
+
+                for i in range(engine_count):
+                        engine = Engine(engine_name)
+                        fileno = engine.process.stdout.fileno()
+                        self.engines[fileno] = engine
+                        self.idle.add(fileno)
+
+                        engine.process.stdin.write("xboard\n")
+                        engine.process.stdin.write("protover 2\n")
+                        has_setboard = 0
+                        has_memory = 0
+                        has_smp = 0
+
+                        while True:
+                                # Wait max 2 seconds
+                                result = select.select([fileno], [], [], 2.0)
+                                if len(result[0]) == 0:
+                                        print "*** Engine doesn't support Winboard protocol version 2"
+                                        sys.exit(10)
+
+                                line = engine.process.stdout.readline()
+                                if line == "":
+                                        print "*** Engine terminated"
+                                        sys.exit(10)
+
+                                line = line.rstrip().split()
+
+                                if len(line) == 0 or line[0] != "feature":
+                                        continue
+
+                                if "setboard=1" in line:
+                                        engine.process.stdin.write("accepted setboard\n")
+                                        has_setboard = 1
+
+                                if "memory=1" in line:
+                                        engine.process.stdin.write("accepted memory\n")
+                                        has_setboard = 1
+
+                                if "smp=1" in line:
+                                        engine.process.stdin.write("accepted smp\n")
+                                        has_smp = 1
+
+                                if "done=1" in line:
+                                        break
+
+                        if not has_setboard:
+                                print "*** Engine doesn't support setboard command"
+                                sys.exit(10)
+
+                        if has_memory:
+                                engine.process.stdin.write("memory 64\n")
+
+                        if has_smp:
+                                engine.process.stdin.write("cores 1\n")
+
+                        engine.process.stdin.write("book off\n") # Crafty
+
+        def quit(self):
+                # Terminate all engines
+                for fileno in self.engines:
+                        engine = self.engines[fileno]
+                        engine.process.stdin.write('quit\n')
+                self.engines = {}
+
+        def analyze(self, line, movetime):
+
+                # wait for an angine to be idle
+                if len(self.idle) == 0:
+                        self.wait()
+
+                assert len(self.idle) > 0
+
+                fileno = self.idle.pop()
+                self.busy.add(fileno)
+
+                engine = self.engines[fileno]
+
+                engine.id = self.input
+                engine.line = line
+
+                pos = line.split()[0:4]
+                pos = ' '.join(pos)
+                engine.process.stdin.write("new\n")
+                engine.process.stdin.write("setboard %s\n" % pos)
+                engine.process.stdin.write("easy\n")
+                engine.process.stdin.write("nopost\n")
+                engine.process.stdin.write("st %d\n" % movetime)
+
+                engine.process.stdin.write("go\n")
+
+                self.input += 1
+
+        def wait(self):
+                assert len(self.busy) > 0
+
+                while True:
+                        result = select.select(self.busy, [], [])
+                        fileno = result[0][0]
+                        engine = self.engines[fileno]
+
+                        # I/O happened
+                        line = engine.process.stdout.readline()
+                        line = line.split()
+                        if len(line) > 0 and line[0] == "move":
+                                move = line[1]
+                                break
+                        if len(line) == 3 and line[1] == "...":
+                                move = line[2]
+                                break
+
+                self.buffer[engine.id] = "%s bm %s;" % (engine.line, move)
+
+                while self.output in self.buffer:
+                        print self.buffer[self.output]
+                        del self.buffer[self.output]
+                        self.output += 1
+                sys.stdout.flush()
+
+                engine.line = None
+
+                self.busy.remove(fileno)
+                self.idle.add(fileno)
+
+if __name__ == '__main__':
+
+        if len(sys.argv) not in [2,3,4]:
+                usage()
+                sys.exit(10)
+
+        engine_name = sys.argv[1]
+
+        if len(sys.argv) > 2:
+                engine_count = int(sys.argv[2])
+        else:
+                engine_count = 1
+
+        if len(sys.argv) > 3:
+                movetime = float(sys.argv[3])
+        else:
+                movetime = 1.0
+
+        engine_pool = EnginePool(engine_name, engine_count)
+
+        for line in sys.stdin:
+                engine_pool.analyze(line.rstrip(), movetime)
+
+        while len(engine_pool.busy) > 0:
+                engine_pool.wait()
+
+        engine_pool.quit()
+
